@@ -1,0 +1,18 @@
+# Local Python environments
+.venv/
+venv/
+
+# Generated upgrade evidence
+evidence/*
+!evidence/.gitkeep
+
+# Backups / logs
+*.backup
+*.bak
+*.log
+*.retry
+
+# Python temporary files
+__pycache__/
+*.pyc
+

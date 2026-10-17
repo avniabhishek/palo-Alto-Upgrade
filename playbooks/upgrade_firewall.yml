@@ -1,0 +1,177 @@
+---
+- name: Upgrade one Panorama-managed Palo Alto firewall
+  hosts: panorama_lab
+  connection: local
+  gather_facts: false
+  serial: 1
+
+  vars:
+    source_version: "11.1.13-h5"
+    base_version: "11.2.0"
+    target_version: "11.2.10-h14"
+    upgrade_approved: false
+    change_reference: "REPLACE_WITH_CHANGE_OR_LAB_REFERENCE"
+    evidence_dir: "{{ playbook_dir }}/../evidence"
+    reboot_initial_delay: 180
+    reboot_check_interval: 30
+    reboot_timeout: 2400
+
+    firewall_provider:
+      ip_address: "{{ ansible_host }}"
+      username: "{{ panorama_username }}"
+      password: "{{ panorama_password }}"
+      serial_number: "{{ firewall_serial }}"
+
+  pre_tasks:
+    - name: Validate target credentials and explicit approval
+      ansible.builtin.assert:
+        that:
+          - groups['panorama_lab'] | length == 1
+          - firewall_serial is defined
+          - firewall_serial | string | trim | length > 0
+          - "'REPLACE' not in (firewall_serial | string)"
+          - "'REPLACE' not in (ansible_host | string)"
+          - panorama_username is defined
+          - panorama_password is defined
+          - source_version == '11.1.13-h5'
+          - base_version == '11.2.0'
+          - target_version == '11.2.10-h14'
+          - upgrade_approved | bool
+          - "'REPLACE' not in change_reference"
+        fail_msg: >-
+          Upgrade blocked. Confirm Panorama address, firewall serial, Vault
+          variables, source/base/target versions, change reference and explicit
+          approval before running this playbook.
+      no_log: true
+
+    - name: Create protected evidence directory
+      ansible.builtin.file:
+        path: "{{ evidence_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Collect selected firewall facts through Panorama before upgrade
+      paloaltonetworks.panos.panos_facts:
+        provider: "{{ firewall_provider }}"
+        gather_subset:
+          - system
+      register: precheck
+      no_log: false
+
+    - name: Display selected firewall identity before upgrade
+      ansible.builtin.debug:
+        msg:
+          - "Configured target serial: {{ firewall_serial }}"
+          - "Returned serial: {{ precheck.ansible_facts.ansible_net_serial | default('UNKNOWN') }}"
+          - "Returned hostname: {{ precheck.ansible_facts.ansible_net_hostname | default('UNKNOWN') }}"
+          - "Returned PAN-OS: {{ precheck.ansible_facts.ansible_net_version | default('UNKNOWN') }}"
+
+    - name: Verify exact source PAN-OS version
+      ansible.builtin.assert:
+        that:
+          - >-
+            (precheck.ansible_facts.ansible_net_version | default('') | string | trim)
+            ==
+            (source_version | string | trim)
+        fail_msg: >-
+          Upgrade blocked. The serial-targeted firewall reports PAN-OS
+          {{ precheck.ansible_facts.ansible_net_version | default('UNKNOWN') }},
+          but the approved source version is {{ source_version }}.
+
+    - name: Save non-secret pre-upgrade evidence
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/pre_upgrade_summary.json"
+        mode: "0600"
+        content: >-
+          {{ {
+            'change_reference': change_reference,
+            'configured_firewall_serial': firewall_serial,
+            'reported_serial': precheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
+            'hostname': precheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
+            'source_version': precheck.ansible_facts.ansible_net_version | default('UNKNOWN'),
+            'base_version': base_version,
+            'target_version': target_version
+          } | to_nice_json }}
+
+    - name: Confirm selected firewall is ready before upgrade
+      paloaltonetworks.panos.panos_check:
+        provider: "{{ firewall_provider }}"
+        interval: 15
+        timeout: 300
+      no_log: true
+
+  tasks:
+    - name: Download PAN-OS 11.2.0 base image to selected firewall through Panorama
+      paloaltonetworks.panos.panos_software:
+        provider: "{{ firewall_provider }}"
+        version: "{{ base_version }}"
+        download: true
+        install: false
+        restart: false
+        perform_software_check: false
+      register: base_download
+      no_log: true
+
+    - name: Download install and restart selected firewall with PAN-OS 11.2.10-h14
+      paloaltonetworks.panos.panos_software:
+        provider: "{{ firewall_provider }}"
+        version: "{{ target_version }}"
+        download: true
+        install: true
+        restart: true
+        perform_software_check: true
+      register: target_upgrade
+      no_log: true
+
+    - name: Wait for selected firewall readiness after restart
+      paloaltonetworks.panos.panos_check:
+        provider: "{{ firewall_provider }}"
+        initial_delay: "{{ reboot_initial_delay | int }}"
+        interval: "{{ reboot_check_interval | int }}"
+        timeout: "{{ reboot_timeout | int }}"
+      no_log: true
+
+    - name: Collect selected firewall facts through Panorama after upgrade
+      paloaltonetworks.panos.panos_facts:
+        provider: "{{ firewall_provider }}"
+        gather_subset:
+          - system
+      register: postcheck
+      no_log: true
+
+    - name: Verify exact target PAN-OS version
+      ansible.builtin.assert:
+        that:
+          - >-
+            (postcheck.ansible_facts.ansible_net_version | default('') | string | trim)
+            ==
+            (target_version | string | trim)
+        fail_msg: >-
+          Upgrade operation ended, but the serial-targeted firewall reports
+          {{ postcheck.ansible_facts.ansible_net_version | default('UNKNOWN') }}
+          instead of {{ target_version }}. Review Panorama jobs and device state.
+
+    - name: Save non-secret post-upgrade evidence
+      ansible.builtin.copy:
+        dest: "{{ evidence_dir }}/post_upgrade_summary.json"
+        mode: "0600"
+        content: >-
+          {{ {
+            'change_reference': change_reference,
+            'configured_firewall_serial': firewall_serial,
+            'reported_serial': postcheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
+            'hostname': postcheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
+            'reported_version': postcheck.ansible_facts.ansible_net_version | default('UNKNOWN'),
+            'target_version': target_version,
+            'version_check': 'PASS'
+          } | to_nice_json }}
+
+    - name: Display completion summary
+      ansible.builtin.debug:
+        msg:
+          - "Configured firewall serial: {{ firewall_serial }}"
+          - "Upgrade completed: {{ source_version }} -> {{ target_version }}"
+          - "Reported PAN-OS: {{ postcheck.ansible_facts.ansible_net_version }}"
+          - "Evidence directory: {{ evidence_dir }}"
+          - "Validate traffic, interfaces, routes, VPNs and logging before closure."
+
