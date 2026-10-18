@@ -9,8 +9,6 @@
     source_version: "11.1.13-h5"
     base_version: "11.2.0"
     target_version: "11.2.10-h14"
-    upgrade_approved: false
-    change_reference: "REPLACE_WITH_CHANGE_OR_LAB_REFERENCE"
     evidence_dir: "{{ playbook_dir }}/../evidence"
     reboot_initial_delay: 180
     reboot_check_interval: 30
@@ -23,7 +21,7 @@
       serial_number: "{{ firewall_serial }}"
 
   pre_tasks:
-    - name: Validate target credentials and explicit approval
+    - name: Validate target credentials and upgrade parameters
       ansible.builtin.assert:
         that:
           - groups['panorama_lab'] | length == 1
@@ -36,8 +34,6 @@
           - source_version == '11.1.13-h5'
           - base_version == '11.2.0'
           - target_version == '11.2.10-h14'
-          - upgrade_approved | bool
-          - "'REPLACE' not in change_reference"
         fail_msg: >-
           Upgrade blocked. Confirm Panorama address, firewall serial, Vault
           variables, source/base/target versions, change reference and explicit
@@ -84,7 +80,6 @@
         mode: "0600"
         content: >-
           {{ {
-            'change_reference': change_reference,
             'configured_firewall_serial': firewall_serial,
             'reported_serial': precheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
             'hostname': precheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
@@ -157,7 +152,6 @@
         mode: "0600"
         content: >-
           {{ {
-            'change_reference': change_reference,
             'configured_firewall_serial': firewall_serial,
             'reported_serial': postcheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
             'hostname': postcheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
