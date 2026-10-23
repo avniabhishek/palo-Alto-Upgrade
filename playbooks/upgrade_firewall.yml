@@ -1,113 +1,314 @@
 ---
+- name: Load PAN-OS upgrade request from CSV
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    firewall_upgrade_csv: "/home/azureuser/firewall_upgrade_requests.csv"
+
+  tasks:
+    - name: Verify firewall upgrade CSV exists
+      ansible.builtin.stat:
+        path: "{{ firewall_upgrade_csv }}"
+      register: upgrade_csv_file
+
+    - name: Stop when firewall upgrade CSV is missing
+      ansible.builtin.assert:
+        that:
+          - upgrade_csv_file.stat.exists
+          - upgrade_csv_file.stat.isreg
+        fail_msg: >-
+          Upgrade request CSV does not exist: {{ firewall_upgrade_csv }}
+
+
+    - name: Read PAN-OS upgrade requests using Python
+      ansible.builtin.command:
+        argv:
+          - "/opt/ansible-panos/bin/python"
+          - "-c"
+          - |
+            import csv
+            import json
+            import sys
+
+            csv_path = sys.argv[1]
+
+            with open(
+                csv_path,
+                mode="r",
+                encoding="utf-8-sig",
+                newline=""
+            ) as csv_file:
+
+                reader = csv.DictReader(csv_file)
+
+                if reader.fieldnames is None:
+                    raise SystemExit(
+                        "CSV does not contain a header row"
+                    )
+
+                fieldnames = [
+                    str(field).strip()
+                    for field in reader.fieldnames
+                    if field is not None
+                ]
+
+                records = []
+
+                for row_number, raw_row in enumerate(
+                    reader,
+                    start=2
+                ):
+                    row = {
+                        str(key).strip(): (
+                            str(value).strip()
+                            if value is not None
+                            else ""
+                        )
+                        for key, value in raw_row.items()
+                        if key is not None
+                    }
+
+                    if not any(row.values()):
+                        continue
+
+                    row["_csv_row"] = row_number
+                    records.append(row)
+
+                print(
+                    json.dumps(
+                        {
+                            "fieldnames": fieldnames,
+                            "records": records
+                        }
+                    )
+                )
+
+          - "{{ firewall_upgrade_csv }}"
+
+      register: csv_read_result
+      changed_when: false
+
+    - name: Convert CSV output to Ansible data
+      ansible.builtin.set_fact:
+        upgrade_requests:
+          list: "{{ (csv_read_result.stdout | from_json).records }}"
+    - name: Validate CSV contains request rows
+      ansible.builtin.assert:
+        that:
+          - upgrade_requests.list | length > 0
+        fail_msg: The upgrade CSV does not contain any request rows.
+
+    - name: Validate required CSV columns
+      ansible.builtin.assert:
+        that:
+          - "'Request_ID' in upgrade_requests.list[0]"
+          - "'Firewall_Name' in upgrade_requests.list[0]"
+          - "'Firewall_Serial' in upgrade_requests.list[0]"
+          - "'Target_Version' in upgrade_requests.list[0]"
+          - "'Enabled' in upgrade_requests.list[0]"
+        fail_msg: >-
+          CSV must contain Request_ID, Firewall_Name, Firewall_Serial,
+          Target_Version and Enabled.
+
+
+    - name: Select enabled upgrade requests
+      ansible.builtin.set_fact:
+        enabled_upgrades: >-
+          {{
+            upgrade_requests.list
+            | selectattr('Enabled', 'defined')
+            | selectattr('Enabled', 'match', '(?i)^(yes|true|1)$')
+            | list
+          }}
+
+    - name: Require exactly one enabled firewall
+      ansible.builtin.assert:
+        that:
+          - enabled_upgrades | length == 1
+        fail_msg: >-
+          Exactly one firewall must have Enabled=Yes.
+          Found {{ enabled_upgrades | length }} enabled requests.
+
+    - name: Validate enabled CSV request values
+      ansible.builtin.assert:
+        that:
+          - item.Request_ID | string | trim | length > 0
+          - item.Firewall_Name | string | trim | length > 0
+          - item.Firewall_Serial | string | trim | length > 0
+          - item.Target_Version | string | trim | length > 0
+          - item.Firewall_Name is match('^[A-Za-z0-9_.-]+$')
+          - item.Firewall_Serial is match('^[A-Za-z0-9]+$')
+          - item.Target_Version is match('^[0-9]+\\.[0-9]+\\.[0-9]+([.-][A-Za-z0-9]+)*$')
+        fail_msg: >-
+          Invalid request data in CSV row {{ item._csv_row }}.
+          Check Request_ID, Firewall_Name, Firewall_Serial and Target_Version.
+      loop: "{{ enabled_upgrades }}"
+      loop_control:
+        label: "CSV row {{ item._csv_row }}: {{ item.Firewall_Name | default('unknown') }}"
+
+    - name: Add CSV request to runtime upgrade inventory
+      ansible.builtin.add_host:
+        name: "{{ item.Firewall_Name | trim }}"
+        groups:
+          - firewall_upgrade_targets
+        csv_row: "{{ item._csv_row }}"
+        request_id: "{{ item.Request_ID | trim }}"
+        requested_firewall_name: "{{ item.Firewall_Name | trim }}"
+        firewall_serial: "{{ item.Firewall_Serial | trim }}"
+        target_version: "{{ item.Target_Version | trim }}"
+        ansible_connection: local
+        ansible_python_interpreter: "/opt/ansible-panos/bin/python"
+      loop: "{{ enabled_upgrades }}"
+      loop_control:
+        label: "{{ item.Firewall_Name }} | serial={{ item.Firewall_Serial }} | target={{ item.Target_Version }}"
+
+    - name: Display selected CSV upgrade request
+      ansible.builtin.debug:
+        msg:
+          - "CSV row: {{ item._csv_row }}"
+          - "Request ID: {{ item.Request_ID }}"
+          - "Firewall name: {{ item.Firewall_Name }}"
+          - "Firewall serial: {{ item.Firewall_Serial }}"
+          - "Requested target: {{ item.Target_Version }}"
+      loop: "{{ enabled_upgrades }}"
+      loop_control:
+        label: "{{ item.Firewall_Name }}"
+
 - name: Upgrade one Panorama-managed Palo Alto firewall
-  hosts: panorama_lab
+  hosts: firewall_upgrade_targets
   connection: local
   gather_facts: false
   serial: 1
 
+  vars_files:
+    - "{{ playbook_dir }}/../secret.yml"
+
   vars:
-    source_version: "11.1.13-h5"
-    base_version: "11.2.0"
-    target_version: "11.2.10-h14"
-    evidence_dir: "{{ playbook_dir }}/../evidence"
-    reboot_initial_delay: 180
-    reboot_check_interval: 30
-    reboot_timeout: 2400
+    evidence_root: "{{ playbook_dir }}/../evidence"
 
     firewall_provider:
-      ip_address: "{{ ansible_host }}"
+      ip_address: "{{ panorama_ip }}"
       username: "{{ panorama_username }}"
       password: "{{ panorama_password }}"
       serial_number: "{{ firewall_serial }}"
 
+    reboot_initial_delay: 180
+    reboot_check_interval: 30
+    reboot_timeout: 2400
+
   pre_tasks:
-    - name: Validate target credentials and upgrade parameters
+    - name: Validate CSV and Panorama upgrade parameters
       ansible.builtin.assert:
         that:
-          - groups['panorama_lab'] | length == 1
+          - panorama_ip is defined
+          - panorama_ip | string | trim | length > 0
+          - panorama_username is defined
+          - panorama_username | string | trim | length > 0
+          - panorama_password is defined
+          - panorama_password | string | length > 0
+          - request_id is defined
+          - request_id | string | trim | length > 0
+          - requested_firewall_name is defined
+          - requested_firewall_name | string | trim | length > 0
           - firewall_serial is defined
           - firewall_serial | string | trim | length > 0
-          - "'REPLACE' not in (firewall_serial | string)"
-          - "'REPLACE' not in (ansible_host | string)"
-          - panorama_username is defined
-          - panorama_password is defined
-          - source_version == '11.1.13-h5'
-          - base_version == '11.2.0'
-          - target_version == '11.2.10-h14'
+          - target_version is defined
+          - target_version | string | trim | length > 0
+        fail_msg: Upgrade blocked. Panorama or CSV variables are missing.
+
+    - name: Derive target release train and base image
+      ansible.builtin.set_fact:
+        target_release_train: "{{ target_version.split('.')[0:2] | join('.') }}"
+        target_base_version: "{{ (target_version.split('.')[0:2] | join('.')) ~ '.0' }}"
+        evidence_directory: "{{ evidence_root }}/{{ request_id }}_{{ requested_firewall_name }}"
+
+    - name: Query current firewall facts through Panorama
+      block:
+        - name: Retrieve serial-targeted firewall system facts
+          paloaltonetworks.panos.panos_facts:
+            provider: "{{ firewall_provider }}"
+            gather_subset:
+              - system
+      rescue:
+        - name: Stop when requested firewall is unavailable through Panorama
+          ansible.builtin.fail:
+            msg: >-
+              Upgrade blocked before any software operation.
+              Request ID={{ request_id }}; firewall={{ requested_firewall_name }};
+              CSV serial={{ firewall_serial }}; Panorama={{ panorama_ip }}.
+              Confirm the serial is correct and the firewall is connected in Panorama.
+
+    - name: Capture current firewall information from Panorama
+      ansible.builtin.set_fact:
+        current_version: "{{ ansible_net_version | default('') | string | trim }}"
+        discovered_hostname: "{{ ansible_net_hostname | default(requested_firewall_name) | string | trim }}"
+        current_release_train: "{{ (ansible_net_version | default('') | string | trim).split('.')[0:2] | join('.') }}"
+
+    - name: Validate Panorama returned firewall system facts
+      ansible.builtin.assert:
+        that:
+          - discovered_hostname | length > 0
+          - current_version | length > 0
         fail_msg: >-
-          Upgrade blocked. Confirm Panorama address, firewall serial, Vault
-          variables, source/base/target versions, change reference and explicit
-          approval before running this playbook.
-      no_log: true
+          Panorama did not return valid system facts for CSV serial {{ firewall_serial }}.
+        success_msg: >-
+          Panorama returned facts for {{ discovered_hostname }} running {{ current_version }}.
+
+    - name: Stop when requested target is already installed
+      ansible.builtin.assert:
+        that:
+          - current_version != target_version
+        fail_msg: >-
+          No upgrade required. {{ discovered_hostname }} already runs {{ target_version }}.
+
+    - name: Display validated upgrade plan
+      ansible.builtin.debug:
+        msg:
+          - "Request ID: {{ request_id }}"
+          - "CSV firewall name: {{ requested_firewall_name }}"
+          - "Panorama firewall name: {{ discovered_hostname }}"
+          - "CSV serial used for Panorama targeting: {{ firewall_serial }}"
+          - "Current PAN-OS from Panorama: {{ current_version }}"
+          - "Required target base image: {{ target_base_version }}"
+          - "Requested target from CSV: {{ target_version }}"
 
     - name: Create protected evidence directory
       ansible.builtin.file:
-        path: "{{ evidence_dir }}"
+        path: "{{ evidence_directory }}"
         state: directory
         mode: "0700"
+      delegate_to: localhost
 
-    - name: Collect selected firewall facts through Panorama before upgrade
-      paloaltonetworks.panos.panos_facts:
-        provider: "{{ firewall_provider }}"
-        gather_subset:
-          - system
-      register: precheck
-      no_log: false
-
-    - name: Display selected firewall identity before upgrade
-      ansible.builtin.debug:
-        msg:
-          - "Configured target serial: {{ firewall_serial }}"
-          - "Returned serial: {{ precheck.ansible_facts.ansible_net_serial | default('UNKNOWN') }}"
-          - "Returned hostname: {{ precheck.ansible_facts.ansible_net_hostname | default('UNKNOWN') }}"
-          - "Returned PAN-OS: {{ precheck.ansible_facts.ansible_net_version | default('UNKNOWN') }}"
-
-    - name: Verify exact source PAN-OS version
-      ansible.builtin.assert:
-        that:
-          - >-
-            (precheck.ansible_facts.ansible_net_version | default('') | string | trim)
-            ==
-            (source_version | string | trim)
-        fail_msg: >-
-          Upgrade blocked. The serial-targeted firewall reports PAN-OS
-          {{ precheck.ansible_facts.ansible_net_version | default('UNKNOWN') }},
-          but the approved source version is {{ source_version }}.
-
-    - name: Save non-secret pre-upgrade evidence
+    - name: Write pre-upgrade evidence
       ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/pre_upgrade_summary.json"
+        dest: "{{ evidence_directory }}/pre_upgrade_plan.yml"
         mode: "0600"
-        content: >-
-          {{ {
-            'configured_firewall_serial': firewall_serial,
-            'reported_serial': precheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
-            'hostname': precheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
-            'source_version': precheck.ansible_facts.ansible_net_version | default('UNKNOWN'),
-            'base_version': base_version,
-            'target_version': target_version
-          } | to_nice_json }}
-
-    - name: Confirm selected firewall is ready before upgrade
-      paloaltonetworks.panos.panos_check:
-        provider: "{{ firewall_provider }}"
-        interval: 15
-        timeout: 300
-      no_log: true
+        content: |
+          csv_row: "{{ csv_row }}"
+          request_id: "{{ request_id }}"
+          csv_firewall_name: "{{ requested_firewall_name }}"
+          panorama_firewall_name: "{{ discovered_hostname }}"
+          firewall_serial: "{{ firewall_serial }}"
+          current_version: "{{ current_version }}"
+          target_base_version: "{{ target_base_version }}"
+          target_version: "{{ target_version }}"
+      delegate_to: localhost
 
   tasks:
-    - name: Download PAN-OS 11.2.0 base image to selected firewall through Panorama
+    - name: Download required target base image
       paloaltonetworks.panos.panos_software:
         provider: "{{ firewall_provider }}"
-        version: "{{ base_version }}"
+        version: "{{ target_base_version }}"
         download: true
         install: false
         restart: false
-        perform_software_check: false
-      register: base_download
-      no_log: true
+        perform_software_check: true
+        timeout: 3600
+      when: current_release_train != target_release_train
 
-    - name: Download install and restart selected firewall with PAN-OS 11.2.10-h14
+    - name: Download install and restart on requested PAN-OS target
       paloaltonetworks.panos.panos_software:
         provider: "{{ firewall_provider }}"
         version: "{{ target_version }}"
@@ -115,57 +316,68 @@
         install: true
         restart: true
         perform_software_check: true
-      register: target_upgrade
-      no_log: true
+        timeout: 7200
 
-    - name: Wait for selected firewall readiness after restart
+    - name: Wait for firewall readiness through Panorama
       paloaltonetworks.panos.panos_check:
         provider: "{{ firewall_provider }}"
-        initial_delay: "{{ reboot_initial_delay | int }}"
-        interval: "{{ reboot_check_interval | int }}"
-        timeout: "{{ reboot_timeout | int }}"
-      no_log: true
+        initial_delay: "{{ reboot_initial_delay }}"
+        interval: "{{ reboot_check_interval }}"
+        timeout: "{{ reboot_timeout }}"
 
-    - name: Collect selected firewall facts through Panorama after upgrade
-      paloaltonetworks.panos.panos_facts:
-        provider: "{{ firewall_provider }}"
-        gather_subset:
-          - system
-      register: postcheck
-      no_log: true
+    - name: Query post-upgrade firewall facts through Panorama
+      block:
+        - name: Retrieve post-upgrade system facts
+          paloaltonetworks.panos.panos_facts:
+            provider: "{{ firewall_provider }}"
+            gather_subset:
+              - system
+      rescue:
+        - name: Stop when post-upgrade facts cannot be retrieved
+          ansible.builtin.fail:
+            msg: >-
+              Post-upgrade validation could not query CSV serial {{ firewall_serial }}.
 
-    - name: Verify exact target PAN-OS version
+    - name: Capture post-upgrade firewall information
+      ansible.builtin.set_fact:
+        post_upgrade_version: "{{ ansible_net_version | default('') | string | trim }}"
+        post_upgrade_hostname: "{{ ansible_net_hostname | default(discovered_hostname) | string | trim }}"
+
+    - name: Validate post-upgrade PAN-OS version
       ansible.builtin.assert:
         that:
-          - >-
-            (postcheck.ansible_facts.ansible_net_version | default('') | string | trim)
-            ==
-            (target_version | string | trim)
+          - post_upgrade_hostname | length > 0
+          - post_upgrade_version == target_version
         fail_msg: >-
-          Upgrade operation ended, but the serial-targeted firewall reports
-          {{ postcheck.ansible_facts.ansible_net_version | default('UNKNOWN') }}
-          instead of {{ target_version }}. Review Panorama jobs and device state.
+          Post-upgrade validation failed. Previous={{ current_version }},
+          requested={{ target_version }}, reported={{ post_upgrade_version | default('unknown') }}.
+        success_msg: >-
+          {{ post_upgrade_hostname }} upgraded from {{ current_version }} to {{ post_upgrade_version }}.
 
-    - name: Save non-secret post-upgrade evidence
+    - name: Write post-upgrade evidence
       ansible.builtin.copy:
-        dest: "{{ evidence_dir }}/post_upgrade_summary.json"
+        dest: "{{ evidence_directory }}/post_upgrade_result.yml"
         mode: "0600"
-        content: >-
-          {{ {
-            'configured_firewall_serial': firewall_serial,
-            'reported_serial': postcheck.ansible_facts.ansible_net_serial | default('UNKNOWN'),
-            'hostname': postcheck.ansible_facts.ansible_net_hostname | default('UNKNOWN'),
-            'reported_version': postcheck.ansible_facts.ansible_net_version | default('UNKNOWN'),
-            'target_version': target_version,
-            'version_check': 'PASS'
-          } | to_nice_json }}
+        content: |
+          csv_row: "{{ csv_row }}"
+          request_id: "{{ request_id }}"
+          csv_firewall_name: "{{ requested_firewall_name }}"
+          panorama_firewall_name: "{{ post_upgrade_hostname }}"
+          firewall_serial: "{{ firewall_serial }}"
+          previous_version: "{{ current_version }}"
+          requested_target_version: "{{ target_version }}"
+          reported_post_upgrade_version: "{{ post_upgrade_version }}"
+          upgrade_status: "SUCCESS"
+      delegate_to: localhost
 
-    - name: Display completion summary
+    - name: Display final upgrade result
       ansible.builtin.debug:
         msg:
-          - "Configured firewall serial: {{ firewall_serial }}"
-          - "Upgrade completed: {{ source_version }} -> {{ target_version }}"
-          - "Reported PAN-OS: {{ postcheck.ansible_facts.ansible_net_version }}"
-          - "Evidence directory: {{ evidence_dir }}"
-          - "Validate traffic, interfaces, routes, VPNs and logging before closure."
+          - "Request ID: {{ request_id }}"
+          - "Firewall: {{ post_upgrade_hostname }}"
+          - "CSV serial: {{ firewall_serial }}"
+          - "Previous PAN-OS: {{ current_version }}"
+          - "Current PAN-OS: {{ post_upgrade_version }}"
+          - "Upgrade status: SUCCESS"
+          - "Evidence directory: {{ evidence_directory }}"
 

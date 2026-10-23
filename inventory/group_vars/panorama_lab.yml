@@ -1,7 +1,4 @@
 ---
-firewall_serial: "6BCCDF15A7C28AD"
-source_version: "11.1.13-h5"
-target_version: "11.2.10-h14"
 # Record only; compatibility must be reviewed against vendor matrix.
 expected_panorama_release_train: "12.1"
 
